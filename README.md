@@ -9,6 +9,9 @@
 
 Omni-Commerce Gatekeeper is an agentic commerce gateway designed for wholesale B2B procurement. It strictly **decouples non-deterministic AI negotiation from financial execution**. While Gemini LLM handles semantic negotiation in natural language across WhatsApp and Web channels, financial settlement is protected by a **Zero-Trust Deterministic Margin Gate**, an **AP2 HMAC-SHA256 Cryptographic Cart Mandate**, and **dynamic Razorpay payment rails**.
 
+
+live link : https://omni-commerce-gate-keeper.onrender.com/
+
 ---
 
 ## Architecture Overview
