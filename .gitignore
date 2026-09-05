@@ -1,0 +1,29 @@
+# Python virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# Python byte-code and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local Environment Secrets (never commit API keys)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Editor and OS files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
