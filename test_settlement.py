@@ -67,9 +67,10 @@ def run_settlement_test():
     print(f"✅ ORDER RECONCILED & DISPATCHED")
     print(f"Order ID: {response.get('order_id')}")
     print(f"Waybill ID: {response.get('waybill_id')}")
+    print(f"Full Gross Settled Amount: ₹{response.get('amount_inr', 0):,.2f}")
+    print(f"Platform 5% Commission (Cut): ₹{response.get('platform_commission_inr', 0):,.2f}")
+    print(f"Merchant 95% Payout: ₹{response.get('merchant_payout_inr', 0):,.2f}")
     print(f"Remaining Inventory Stock: {response.get('remaining_stock_kg')} kg")
-    print(f"Platform 5% Commission: ₹{response.get('platform_commission_inr'):,.2f}")
-    print(f"Merchant 95% Payout: ₹{response.get('merchant_payout_inr'):,.2f}")
     print("=" * 70)
 
 if __name__ == "__main__":

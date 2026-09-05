@@ -258,19 +258,8 @@ def validate_margin(proposal: AgentProposal) -> tuple[bool, float]:
     return (proposal.proposed_unit_price >= floor_price), floor_price
 
 def fallback_parser(text: str, product_hint: str = None, qty_hint: int = None, rate_hint: float = None) -> AgentProposal:
-    # 1. Quantity
-    if qty_hint and qty_hint > 0:
-        qty = qty_hint
-    else:
-        qty_match = re.search(r'(\d+)\s*(?:kg|kilos|units|packets|bags|tons|quintals)', text, re.IGNORECASE)
-        if not qty_match:
-            qty_match = re.search(r'\b(?:need|require|want|order|rfq|buy|for)\s+(\d+)\b', text, re.IGNORECASE)
-        if not qty_match:
-            qty_match = re.search(r'(\d+)', text)
-        qty = int(qty_match.group(1)) if qty_match else 200
-
-    # 2. Price / Rate
-    if rate_hint and rate_hint > 0:
+    # 1. Price / Rate extraction first
+    if rate_hint and float(rate_hint) > 0:
         price = float(rate_hint)
     else:
         price_match = re.search(r'(?:₹|rs\.?|inr)\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
@@ -280,7 +269,24 @@ def fallback_parser(text: str, product_hint: str = None, qty_hint: int = None, r
             price_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:/kg|per\s*kg|a\s*kg)', text, re.IGNORECASE)
         price = float(price_match.group(1)) if price_match else None
 
-    # 3. Product & SKU
+    # 2. Strip price substring so numbers in price don't corrupt quantity extraction
+    text_for_qty = text
+    if price is not None:
+        text_for_qty = re.sub(rf'(?:₹|rs\.?|inr)?\s*{re.escape(str(price))}(?:/kg|per\s*kg)?', '', text, flags=re.IGNORECASE)
+        text_for_qty = re.sub(rf'{re.escape(str(int(price)))}\.\d+', '', text_for_qty)
+
+    # 3. Quantity extraction (prioritize explicit hint)
+    if qty_hint and int(qty_hint) > 0:
+        qty = int(qty_hint)
+    else:
+        qty_match = re.search(r'(\d+)\s*(?:kg|kilos|units|packets|bags|tons|quintals)', text_for_qty, re.IGNORECASE)
+        if not qty_match:
+            qty_match = re.search(r'\b(?:need|require|want|order|rfq|buy|for)\s+(\d+)\b', text_for_qty, re.IGNORECASE)
+        if not qty_match:
+            qty_match = re.search(r'(\d+)', text_for_qty)
+        qty = int(qty_match.group(1)) if qty_match else 200
+
+    # 4. Product & SKU
     sku_id, item = resolve_or_create_sku(product_hint or text, price)
     if price is None:
         price = item["retail_price"]
@@ -331,16 +337,24 @@ async def process_negotiation(
     proposal = None
 
     # Step 1: Intent Extraction & Negotiation Parsing
-    if product_hint and qty_hint and rate_hint:
-        # User provided exact parameters from UI
-        sku_id, item = resolve_or_create_sku(product_hint, rate_hint)
+    effective_rate = rate_hint
+    if effective_rate is None or float(effective_rate) <= 0:
+        p_match = re.search(r'(?:₹|rs\.?|inr)\s*(\d+(?:\.\d+)?)', user_input, re.IGNORECASE)
+        if not p_match:
+            p_match = re.search(r'(?:rate|price|at|for|is|offer)\s*(?:is|of|=|:)?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)', user_input, re.IGNORECASE)
+        if p_match and float(p_match.group(1)) > 0:
+            effective_rate = float(p_match.group(1))
+
+    if product_hint and qty_hint and effective_rate:
+        # Contextual parameters preserved
+        sku_id, item = resolve_or_create_sku(product_hint, effective_rate)
         proposal = AgentProposal(
             sku_id=sku_id,
             quantity=int(qty_hint),
-            proposed_unit_price=float(rate_hint),
-            reasoning=f"User-specified parameters: {qty_hint}kg of {item['name']} @ ₹{rate_hint:.2f}/kg.",
+            proposed_unit_price=float(effective_rate),
+            reasoning=f"Procurement parameters: {qty_hint}kg of {item['name']} @ ₹{float(effective_rate):.2f}/kg.",
             detected_language="English",
-            localized_reply=f"Thank you for your proposal. We received your requirement for {qty_hint}kg of {item['name']} at ₹{rate_hint:.2f}/kg."
+            localized_reply=f"Thank you for your proposal. We received your requirement for {qty_hint}kg of {item['name']} at ₹{float(effective_rate):.2f}/kg."
         )
         logs.append(f"[USER PARAMETERS] {proposal.quantity}kg of {item['name']} @ ₹{proposal.proposed_unit_price:.2f}/kg")
         log_event("INTENT_EXTRACTION", f"Received requirement: {proposal.quantity}kg of {item['name']} @ ₹{proposal.proposed_unit_price}/kg")
@@ -375,7 +389,7 @@ async def process_negotiation(
             log_event("AI_REASONING", f"Parsed {proposal.quantity}kg @ ₹{proposal.proposed_unit_price}/kg in {proposal.detected_language}")
         except Exception as e:
             logs.append(f"[PARSER ENGAGED] Using deterministic local parser ({str(e)[:45]}...)")
-            proposal = fallback_parser(user_input, product_hint, qty_hint, rate_hint)
+            proposal = fallback_parser(user_input, product_hint, qty_hint, rate_hint or effective_rate)
 
     item = CATALOG_DB.get(proposal.sku_id)
     if not item:
@@ -549,6 +563,16 @@ async def razorpay_settlement_webhook(payload: dict):
     sku_id = notes.get("sku_id", "SKU_SPICE_PREMIUM")
     quantity_kg = int(notes.get("quantity_kg", 200))
     amount_inr = float(entity.get("amount", 2600000)) / 100.0
+
+    # Ensure full gross order amount and metadata are accurately pulled from registered order
+    if order_id in ORDER_REGISTRY:
+        reg = ORDER_REGISTRY[order_id]
+        if reg.get("total_amount_inr"):
+            amount_inr = float(reg["total_amount_inr"])
+        if reg.get("quantity_kg"):
+            quantity_kg = int(reg["quantity_kg"])
+        if reg.get("sku_id"):
+            sku_id = reg["sku_id"]
     
     # Check for Payment Failure
     if event == "payment.failed" or entity.get("status") == "failed":
@@ -633,7 +657,7 @@ async def razorpay_settlement_webhook(payload: dict):
 # --- EMBEDDED DEMO FRONTEND (INTERACTIVE USER-DRIVEN COMMAND CENTER) ---
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
-    return """
+    return r"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -666,12 +690,15 @@ async def serve_ui():
                 </div>
             </div>
             <div class="flex items-center gap-3 font-mono text-xs">
-                <div class="hidden md:flex items-center gap-2 bg-gray-950 px-3 py-1.5 rounded-lg border border-gray-800">
+                <div class="hidden md:flex items-center gap-2.5 bg-gray-950 px-3.5 py-1.5 rounded-lg border border-gray-800">
                     <span class="text-gray-500">Volume:</span>
                     <span id="metricVolume" class="text-emerald-400 font-bold">0 kg</span>
                     <span class="text-gray-700">|</span>
-                    <span class="text-gray-500">Settled:</span>
-                    <span id="metricRevenue" class="text-cyan-400 font-bold">₹0</span>
+                    <span class="text-gray-500">Full Settled:</span>
+                    <span id="metricRevenue" class="text-cyan-300 font-bold font-mono">₹0</span>
+                    <span class="text-gray-700">|</span>
+                    <span class="text-purple-400">Platform Cut (5%):</span>
+                    <span id="metricCommission" class="text-purple-300 font-bold font-mono">₹0</span>
                 </div>
                 <span class="bg-purple-950/90 text-purple-300 px-2.5 py-1 rounded border border-purple-700/60 shadow-[0_0_10px_rgba(168,85,247,0.15)]">User-Driven</span>
                 <span class="bg-emerald-950/90 text-emerald-300 px-2.5 py-1 rounded border border-emerald-600/60 shadow-[0_0_10px_rgba(16,185,129,0.15)]">AP2 Cryptographic</span>
@@ -1010,7 +1037,21 @@ async def serve_ui():
                 appendChatMessage(message, true);
                 
                 await typeLog(`> 💬 [BUYER DISPATCH] "${message}"`, 'text-gray-300');
-                await evaluateBackendNegotiation(message);
+
+                // Preserve procurement requirement context across negotiation rounds
+                let extractedRate = currentRequirement.rate;
+                const rateMatch = message.match(/(?:₹|rs\.?|inr|\sat\s)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\/kg|per\s*kg)?/i);
+                if (rateMatch && parseFloat(rateMatch[1]) > 0) {
+                    extractedRate = parseFloat(rateMatch[1]);
+                    currentRequirement.rate = extractedRate;
+                }
+
+                await evaluateBackendNegotiation(message, {
+                    product: currentRequirement.product,
+                    quantity: currentRequirement.qty,
+                    target_rate: extractedRate,
+                    supplier_name: currentSelectedSeller ? currentSelectedSeller.name : null
+                });
             }
 
             // --- STEP 4: BACKEND EVALUATION, MARGIN GATING & SETTLEMENT RAILS ---
@@ -1050,17 +1091,42 @@ async def serve_ui():
                     let replyText = (data.reply || '').replace(/\\n/g, '<br/>');
 
                     if (data.status === 'APPROVED' && data.payment_link_url) {
-                        const amountFormatted = (data.amount_inr || (currentRequirement.qty * currentRequirement.rate)).toLocaleString('en-IN');
+                        const orderTotal = Number(data.amount_inr || (currentRequirement.qty * currentRequirement.rate) || 0);
+                        const orderQty = Number(data.quantity_kg || currentRequirement.qty || 200);
+                        const orderUnitRate = (orderTotal / (orderQty || 1)).toFixed(2);
+                        const amountFormatted = orderTotal.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                        const platformFeeFormatted = (orderTotal * 0.05).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                        const merchantPayoutFormatted = (orderTotal * 0.95).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
                         
                         const checkoutCard = `
                             <p class="mb-2 leading-relaxed">${replyText}</p>
                             <div id="checkoutCard_${data.order_id}" class="bg-gray-950 border border-emerald-500/80 rounded-xl p-3.5 mt-2 text-center shadow-lg">
-                                <div class="flex items-center justify-center gap-1.5 text-[10px] text-emerald-400 font-mono uppercase tracking-wider mb-1.5">
+                                <div class="flex items-center justify-center gap-1.5 text-[10px] text-emerald-400 font-mono uppercase tracking-wider mb-2">
                                     <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                                     🔐 AP2 Mandate Cryptographically Signed
                                 </div>
-                                <div class="text-xs text-gray-300 font-mono mb-2">
-                                    Agreed Order Total: <span class="text-white font-bold">₹${amountFormatted}</span>
+                                <div class="bg-black/60 border border-emerald-500/30 rounded-lg p-2.5 mb-2.5 text-left font-mono">
+                                    <div class="flex justify-between items-baseline mb-1">
+                                        <span class="text-xs text-gray-400">Full Order Amount:</span>
+                                        <span class="text-base text-emerald-400 font-extrabold">₹${amountFormatted}</span>
+                                    </div>
+                                    <div class="flex justify-between text-[11px] text-gray-400">
+                                        <span>Order Volume:</span>
+                                        <span class="text-gray-200">${orderQty} kg (${data.product_name || currentRequirement.product})</span>
+                                    </div>
+                                    <div class="flex justify-between text-[11px] text-gray-400">
+                                        <span>Final Unit Price:</span>
+                                        <span class="text-gray-200">₹${orderUnitRate}/kg</span>
+                                    </div>
+                                    <div class="border-t border-gray-800 my-1.5"></div>
+                                    <div class="flex justify-between text-[10px]">
+                                        <span class="text-purple-400">Platform Cut (5%):</span>
+                                        <span class="text-purple-300 font-semibold">₹${platformFeeFormatted}</span>
+                                    </div>
+                                    <div class="flex justify-between text-[10px]">
+                                        <span class="text-gray-400">Merchant Payout (95%):</span>
+                                        <span class="text-gray-300 font-semibold">₹${merchantPayoutFormatted}</span>
+                                    </div>
                                 </div>
                                 <div class="space-y-2">
                                     <a href="${data.payment_link_url}" target="_blank" rel="noopener noreferrer" 
@@ -1068,11 +1134,11 @@ async def serve_ui():
                                         💳 Open Razorpay Payment Link ➔
                                     </a>
                                     <div class="grid grid-cols-2 gap-2 pt-1">
-                                        <button onclick="simulateLiveSettlement('${data.order_id}', '${data.sku_id}', ${data.quantity_kg || 200}, ${data.amount_inr || 26000}, 'success')" 
+                                        <button onclick="simulateLiveSettlement('${data.order_id}', '${data.sku_id}', ${orderQty}, ${orderTotal}, 'success')" 
                                             class="bg-emerald-950/80 hover:bg-emerald-900 active:bg-emerald-800 text-emerald-300 font-bold text-[11px] py-1.5 px-2 rounded-lg border border-emerald-600/60 transition flex items-center justify-center gap-1 shadow">
                                             <span>⚡ Simulate Success</span>
                                         </button>
-                                        <button onclick="simulateLiveSettlement('${data.order_id}', '${data.sku_id}', ${data.quantity_kg || 200}, ${data.amount_inr || 26000}, 'failure')" 
+                                        <button onclick="simulateLiveSettlement('${data.order_id}', '${data.sku_id}', ${orderQty}, ${orderTotal}, 'failure')" 
                                             class="bg-red-950/80 hover:bg-red-900 active:bg-red-800 text-red-300 font-bold text-[11px] py-1.5 px-2 rounded-lg border border-red-600/60 transition flex items-center justify-center gap-1 shadow">
                                             <span>❌ Simulate Failure</span>
                                         </button>
@@ -1085,12 +1151,13 @@ async def serve_ui():
                             </div>
                         `;
                         appendChatMessage(checkoutCard, false);
-                        startOrderStatusPolling(data.order_id, data.sku_id, data.quantity_kg || 200, data.amount_inr || 26000);
+                        startOrderStatusPolling(data.order_id, data.sku_id, orderQty, orderTotal);
                     } else {
                         // Rate was below margin floor or plain counter-offer
                         appendChatMessage(replyText, false);
                         if (data.floor_price) {
-                            document.getElementById('waMessageInput').value = `Can we finalize at ₹${data.floor_price}/kg?`;
+                            currentRequirement.rate = data.floor_price;
+                            document.getElementById('waMessageInput').value = `Can we finalize ${currentRequirement.qty}kg of ${currentRequirement.product} at ₹${data.floor_price}/kg?`;
                         }
                     }
 
@@ -1159,9 +1226,10 @@ async def serve_ui():
                     delete activePollers[data.order_id];
                 }
 
-                const amt = Number(data.amount_inr || 0).toLocaleString('en-IN');
-                const fee = Number(data.platform_commission_inr || (data.amount_inr * 0.05) || 0).toLocaleString('en-IN');
-                const payout = Number(data.merchant_payout_inr || (data.amount_inr * 0.95) || 0).toLocaleString('en-IN');
+                const totalVal = Number(data.amount_inr || 0);
+                const amt = totalVal.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const fee = Number(data.platform_commission_inr || (totalVal * 0.05) || 0).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const payout = Number(data.merchant_payout_inr || (totalVal * 0.95) || 0).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
                 const waybill = data.waybill_id || data.waybill || ('DLV-' + Math.random().toString(36).substring(2, 10).toUpperCase() + '-IN');
 
                 const card = `
@@ -1169,16 +1237,24 @@ async def serve_ui():
                         <div class="flex items-center justify-between pb-2 mb-2.5 border-b border-gray-800">
                             <div class="flex items-center gap-2">
                                 <div class="w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs border border-emerald-500/40">✓</div>
-                                <span class="text-xs font-black text-emerald-400 uppercase tracking-wider">Payment Successful</span>
+                                <span class="text-xs font-black text-emerald-400 uppercase tracking-wider">Payment & Settlement Verified</span>
                             </div>
                             <span class="text-[10px] font-mono bg-emerald-950 text-emerald-300 px-2 py-0.5 rounded border border-emerald-700 font-bold">PAID & DISPATCHED</span>
                         </div>
+
+                        <!-- PROMINENT FULL AMOUNT HERO BADGE -->
+                        <div class="bg-emerald-950/40 border border-emerald-500/40 rounded-lg p-3 mb-3 text-center">
+                            <span class="text-[10px] text-gray-400 uppercase tracking-wider block font-mono">Full Gross Transaction Value</span>
+                            <span class="text-2xl font-black text-emerald-400 font-mono tracking-tight">₹${amt}</span>
+                        </div>
+
                         <div class="space-y-1.5 text-xs font-mono">
                             <div class="flex justify-between"><span class="text-gray-400">Order ID:</span> <span class="text-white font-bold">${data.order_id}</span></div>
-                            <div class="flex justify-between"><span class="text-gray-400">Settled Total:</span> <span class="text-emerald-400 font-bold">₹${amt}</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">Full Gross Settled:</span> <span class="text-emerald-400 font-bold">₹${amt}</span></div>
                             <div class="flex justify-between"><span class="text-gray-400">Delhivery Waybill:</span> <span class="text-cyan-300 font-bold">${waybill}</span></div>
-                            <div class="flex justify-between"><span class="text-gray-400">5% Platform Split:</span> <span class="text-purple-300">₹${fee}</span></div>
-                            <div class="flex justify-between"><span class="text-gray-400">95% Warehouse Payout:</span> <span class="text-gray-300">₹${payout}</span></div>
+                            <div class="border-t border-gray-800/80 my-1 pt-1"></div>
+                            <div class="flex justify-between"><span class="text-purple-400">Platform Cut (5% Retained):</span> <span class="text-purple-300 font-semibold">₹${fee}</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">Merchant Payout (95%):</span> <span class="text-gray-300 font-semibold">₹${payout}</span></div>
                         </div>
                         <div class="mt-3 pt-2 border-t border-gray-800/80 text-[11px] text-gray-300 flex items-center gap-2">
                             <span class="text-emerald-400 font-bold">🚚 Fulfillment:</span>
@@ -1305,7 +1381,11 @@ async def serve_ui():
                     const data = await res.json();
                     if (data.metrics) {
                         document.getElementById('metricVolume').innerText = `${data.metrics.total_volume_kg.toLocaleString()} kg`;
-                        document.getElementById('metricRevenue').innerText = `₹${data.metrics.revenue_inr.toLocaleString('en-IN')}`;
+                        document.getElementById('metricRevenue').innerText = `₹${(data.metrics.revenue_inr || 0).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                        const commElem = document.getElementById('metricCommission');
+                        if (commElem) {
+                            commElem.innerText = `₹${(data.metrics.platform_commission_inr || 0).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                        }
                     }
                 } catch (e) {}
             }
